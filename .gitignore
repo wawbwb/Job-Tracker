@@ -1,0 +1,11 @@
+# Local application data and private recruitment information
+/data/*
+!/data/.gitkeep
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Local development files
+.vscode/*.log
+*.log
