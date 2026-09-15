@@ -13,6 +13,7 @@ from src.parser.beisen import BeisenParser
 from src.parser.feishu import FeishuParser
 from src.parser.moka import MokaParser
 from src.parser.other import OtherParser
+from src.urls import normalize_query_url
 
 
 logger = logging.getLogger(__name__)
@@ -23,8 +24,15 @@ class BrowserManager:
 		self.profiles_dir = Path(profiles_dir)
 		self.profiles_dir.mkdir(parents=True, exist_ok=True)
 
-	def fetch_status(self, url: str, company: str, on_message: Callable[[str], None] | None = None) -> str:
+	def fetch_status(
+		self,
+		url: str,
+		company: str,
+		on_message: Callable[[str], None] | None = None,
+		allow_manual_login: bool = True,
+	) -> str:
 		"""Reuse a small storage-state file and show a browser only when needed."""
+		url = normalize_query_url(url)
 		from playwright.sync_api import sync_playwright
 
 		state_path = self.profile_for(company)
@@ -72,6 +80,10 @@ class BrowserManager:
 			else:
 				logger.info("未找到保存的登录状态，跳过无头等待: company=%s", company)
 
+			if not allow_manual_login:
+				logger.warning("批量刷新跳过人工登录: company=%s", company)
+				return "未知"
+
 			logger.warning("需要人工登录或页面状态不可读，打开可见浏览器: company=%s", company)
 			browser = playwright.chromium.launch(headless=False)
 			context = browser.new_context(**context_options)
@@ -93,6 +105,7 @@ class BrowserManager:
 
 	def open_for_view(self, url: str, company: str, on_message: Callable[[str], None] | None = None) -> None:
 		"""Open a visible page with the saved session and keep it open for manual viewing."""
+		url = normalize_query_url(url)
 		from playwright.sync_api import sync_playwright
 
 		state_path = self.profile_for(company)

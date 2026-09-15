@@ -6,15 +6,18 @@ import random
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QSignalBlocker, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QBrush, QColor, QFont
 from PyQt6.QtWidgets import (
-	QCompleter, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-	QHeaderView, QMenu, QMessageBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+	QAbstractItemView, QApplication, QCompleter, QHBoxLayout, QLabel, QLineEdit, QPushButton, QStyledItemDelegate,
+	QHeaderView, QMenu, QMessageBox, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from src.browser.manager import BrowserManager
+from src.app_paths import data_directory
 from src.database import Database, now_text
+from src.recruitment_mail import mail_stage
+from src.ui.mail_panel import MailPanel
 
 
 COLUMNS = ["公司名称", "岗位", "工作地点", "查询URL", "平台", "状态", "更新时间", "操作"]
@@ -22,6 +25,21 @@ EDITABLE_COLUMNS = {0: "company", 1: "position", 2: "location", 3: "url"}
 SKIP_QUERY_MARKERS = ("无法查询", "跳过查询", "无需查询")
 TERMINAL_STATUS_MARKERS = ("流程终止", "已终止", "流程结束", "已结束", "已完成", "已淘汰", "淘汰", "已撤回", "已关闭", "未通过", "不合适", "感谢", "谢谢")
 logger = logging.getLogger(__name__)
+
+
+class UrlDelegate(QStyledItemDelegate):
+	editing_started = pyqtSignal()
+
+	def createEditor(self, parent, option, index):
+		self.editing_started.emit()
+		return super().createEditor(parent, option, index)
+
+	def setEditorData(self, editor, index) -> None:
+		full_url = index.data(Qt.ItemDataRole.UserRole + 1)
+		if isinstance(editor, QLineEdit) and full_url is not None:
+			editor.setText(str(full_url))
+		else:
+			super().setEditorData(editor, index)
 
 
 def should_skip_query(url: str) -> bool:
@@ -44,10 +62,11 @@ class RefreshWorker(QObject):
 	failed = pyqtSignal(int, str)
 	message = pyqtSignal(str)
 
-	def __init__(self, job: dict, manager: BrowserManager) -> None:
+	def __init__(self, job: dict, manager: BrowserManager, allow_manual_login: bool = True) -> None:
 		super().__init__()
 		self.job = job
 		self.manager = manager
+		self.allow_manual_login = allow_manual_login
 
 	@pyqtSlot()
 	def run(self) -> None:
@@ -61,7 +80,14 @@ class RefreshWorker(QObject):
 			self.failed.emit(self.job["id"], "查询URL为空")
 			return
 		try:
-			status = self.manager.fetch_status(self.job["url"], self.job["company"], self.message.emit)
+			status = self.manager.fetch_status(
+				self.job["url"],
+				self.job["company"],
+				self.message.emit,
+				allow_manual_login=self.allow_manual_login,
+			)
+			if not self.allow_manual_login and status == "未找到状态":
+				status = "未知"
 			logger.info("刷新完成: job_id=%s status=%s", self.job["id"], status)
 			self.finished.emit(self.job["id"], status)
 		except Exception as error:
@@ -92,16 +118,21 @@ class ViewBrowserWorker(QObject):
 class MainWindow(QWidget):
 	def __init__(self, database: Database | None = None) -> None:
 		super().__init__()
-		self.database = database or Database(Path("data/jobs.db"))
-		self.manager = BrowserManager(Path("data/profiles"))
+		self.database = database or Database(data_directory() / "jobs.db")
+		self.manager = BrowserManager(data_directory() / "profiles")
 		self.threads: list[QThread] = []
 		self.workers: list[RefreshWorker] = []
 		self.batch_total = 0
 		self.batch_done = 0
 		self.batch_queue: list[dict] = []
 		self.batch_active = False
+		self.batch_failures: list[str] = []
+		self.mail_batch_needed = False
 		self.loading = False
-		self.url_double_clicked = False
+		self.pending_url_job_id: int | None = None
+		self.url_open_timer = QTimer(self)
+		self.url_open_timer.setSingleShot(True)
+		self.url_open_timer.timeout.connect(self._open_url_if_single)
 		self.color_maps = {"location": {}, "platform": {}, "status": {}}
 		self.color_palettes = {
 			"location": [("#e7f3ff", "#28628f"), ("#e9f7ef", "#28734a"), ("#fff3df", "#94651e"), ("#f2eaff", "#6945a0"), ("#ffe9ef", "#9b4d67"), ("#e4f4f4", "#286b73"), ("#fff0e8", "#9a5639"), ("#edf3ff", "#42639a"), ("#f4edff", "#7451a3"), ("#eff8e5", "#4c762c"), ("#fff4e9", "#9b6631"), ("#e8f0f4", "#4b6575")],
@@ -213,9 +244,9 @@ class MainWindow(QWidget):
 		layout.setSpacing(16)
 		toolbar = QHBoxLayout()
 		toolbar.setSpacing(10)
-		title = QLabel("求职进度")
-		title.setStyleSheet("font-size: 22px; font-weight: 700; color: #1f3448;")
-		toolbar.addWidget(title)
+		self.page_title = QLabel("求职进度")
+		self.page_title.setStyleSheet("font-size: 22px; font-weight: 700; color: #1f3448;")
+		toolbar.addWidget(self.page_title)
 		toolbar.addStretch()
 		self.progress = QLabel("就绪")
 		self.progress.setStyleSheet("color: #718096; padding: 0 8px;")
@@ -223,17 +254,22 @@ class MainWindow(QWidget):
 		self.count_label = QLabel("共 0 条记录")
 		self.count_label.setStyleSheet("color: #718096; padding: 0 8px;")
 		toolbar.addWidget(self.count_label)
-		add_button = QPushButton("＋ 添加记录")
-		add_button.setObjectName("secondaryButton")
-		add_button.clicked.connect(self.add_row)
-		toolbar.addWidget(add_button)
+		self.add_button = QPushButton("＋ 添加记录")
+		self.add_button.setObjectName("secondaryButton")
+		self.add_button.clicked.connect(self.add_row)
+		toolbar.addWidget(self.add_button)
 		self.update_all_button = QPushButton("↻ 更新全部")
 		self.update_all_button.setObjectName("primaryButton")
 		self.update_all_button.clicked.connect(self.update_all)
 		toolbar.addWidget(self.update_all_button)
 		layout.addLayout(toolbar)
+		self.mail_panel = MailPanel(self.database, self)
+		layout.addWidget(self.mail_panel)
 
 		self.table = QTableWidget(0, len(COLUMNS))
+		url_delegate = UrlDelegate(self.table)
+		url_delegate.editing_started.connect(self._cancel_url_open)
+		self.table.setItemDelegateForColumn(3, url_delegate)
 		self.table.setHorizontalHeaderLabels(COLUMNS)
 		self.table.setAlternatingRowColors(True)
 		self.table.setSortingEnabled(False)
@@ -261,8 +297,17 @@ class MainWindow(QWidget):
 		self.table.setHorizontalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
 		self.table.verticalHeader().setVisible(False)
 		self.table.setShowGrid(False)
-		layout.addWidget(self.table)
+		self.page_stack = QStackedWidget()
+		self.page_stack.addWidget(self.table)
+		layout.addWidget(self.page_stack, 1)
+		self.mail_panel.attach_pages(self.page_stack, self.table)
+		self.mail_panel.page_changed.connect(self._page_changed)
 		self._update_count()
+
+	def _page_changed(self, page: str) -> None:
+		self.page_title.setText({"jobs": "求职进度", "tasks": "招聘待办", "settings": "邮箱设置"}[page])
+		for widget in (self.add_button, self.update_all_button, self.count_label, self.progress):
+			widget.setVisible(page == "jobs")
 
 	def _load_jobs(self) -> None:
 		for job in self.database.list_jobs():
@@ -286,32 +331,33 @@ class MainWindow(QWidget):
 			self.loading = False
 
 	def _append_job(self, job: dict) -> int:
-		row = self.table.rowCount()
-		self.table.insertRow(row)
-		self.table.setRowHeight(row, 42)
-		for column, key in EDITABLE_COLUMNS.items():
-			if column == 2:
-				continue
-			item = QTableWidgetItem(job.get(key, ""))
-			item.setData(Qt.ItemDataRole.UserRole, job["id"])
-			if column == 3:
-				full_url = job.get(key, "")
-				item.setText(self._short_url(full_url))
-				item.setData(Qt.ItemDataRole.UserRole + 1, full_url)
-				item.setForeground(QBrush(QColor("#3576a8")))
-				item.setFont(QFont("Microsoft YaHei UI", 10, QFont.Weight.Normal, True))
-				item.setToolTip(full_url)
-			self.table.setItem(row, column, item)
-		for column, value in ((6, job.get("updated_at", "")),):
-			item = QTableWidgetItem(value)
-			item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-			self.table.setItem(row, column, item)
-		self._install_pill(row, 4, job.get("platform", "其他"), "platform")
-		self._install_status_editor(row, job.get("status", "未查询"))
-		button = QPushButton("刷新")
-		button.clicked.connect(lambda _checked=False, job_id=job["id"]: self.refresh_job(job_id))
-		self.table.setCellWidget(row, 7, button)
-		self._install_location_editor(row, job.get("location", ""))
+		with QSignalBlocker(self.table):
+			row = self.table.rowCount()
+			self.table.insertRow(row)
+			self.table.setRowHeight(row, 42)
+			for column, key in EDITABLE_COLUMNS.items():
+				if column == 2:
+					continue
+				item = QTableWidgetItem(job.get(key, ""))
+				item.setData(Qt.ItemDataRole.UserRole, job["id"])
+				if column == 3:
+					full_url = job.get(key, "")
+					item.setText(self._short_url(full_url))
+					item.setData(Qt.ItemDataRole.UserRole + 1, full_url)
+					item.setForeground(QBrush(QColor("#3576a8")))
+					item.setFont(QFont("Microsoft YaHei UI", 10, QFont.Weight.Normal, True))
+					item.setToolTip(full_url)
+				self.table.setItem(row, column, item)
+			for column, value in ((6, job.get("updated_at", "")),):
+				item = QTableWidgetItem(value)
+				item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+				self.table.setItem(row, column, item)
+			self._install_pill(row, 4, job.get("platform", "其他"), "platform")
+			self._install_status_editor(row, job.get("status", "未查询"))
+			button = QPushButton("刷新")
+			button.clicked.connect(lambda _checked=False, job_id=job["id"]: self.refresh_job(job_id))
+			self.table.setCellWidget(row, 7, button)
+			self._install_location_editor(row, job.get("location", ""))
 		self._update_count()
 		return row
 
@@ -423,15 +469,14 @@ class MainWindow(QWidget):
 		platform_label = self.table.cellWidget(row, 4)
 		if platform_label is None:
 			return
-		values = {}
-		for col, key in EDITABLE_COLUMNS.items():
-			if col == 2:
-				editor = self.table.cellWidget(row, 2)
-				values[key] = editor.text() if isinstance(editor, QLineEdit) else ""
-			else:
-				item = self.table.item(row, col)
-				values[key] = item.text() if item else ""
-		values["id"] = job_id
+		if column == 2:
+			editor = self.table.cellWidget(row, 2)
+			value = editor.text() if isinstance(editor, QLineEdit) else ""
+		else:
+			item = self.table.item(row, column)
+			value = item.text() if item else ""
+		# Other cells may contain display abbreviations, not the saved values.
+		values = {"id": job_id, EDITABLE_COLUMNS[column]: value}
 		saved_id = self.database.save_job(values)
 		if saved_id != job_id:
 			logger.warning("检测到重复记录，已合并: old_job_id=%s kept_job_id=%s", job_id, saved_id)
@@ -481,18 +526,20 @@ class MainWindow(QWidget):
 		if not url_item or not company_item:
 			return
 		url = url_item.data(Qt.ItemDataRole.UserRole + 1) or url_item.text()
-		if not str(url).strip().lower().startswith(("http://", "https://")):
+		if not str(url).strip() or should_skip_query(str(url)):
 			return
-		QTimer.singleShot(250, lambda: self._open_url_if_single(row, url))
+		self.pending_url_job_id = company_item.data(Qt.ItemDataRole.UserRole)
+		self.url_open_timer.start(QApplication.doubleClickInterval() + 50)
 
-	def _open_url_if_single(self, row: int, url: str) -> None:
-		if self.url_double_clicked:
-			self.url_double_clicked = False
+	def _cancel_url_open(self) -> None:
+		self.url_open_timer.stop()
+		self.pending_url_job_id = None
+
+	def _open_url_if_single(self) -> None:
+		job_id = self.pending_url_job_id
+		self._cancel_url_open()
+		if job_id is None or self.batch_active:
 			return
-		company_item = self.table.item(row, 0)
-		if not company_item:
-			return
-		job_id = company_item.data(Qt.ItemDataRole.UserRole)
 		job = self.database.get_job(job_id)
 		if not job:
 			return
@@ -515,15 +562,12 @@ class MainWindow(QWidget):
 	def edit_url_cell(self, row: int, column: int) -> None:
 		if column != 3:
 			return
-		self.url_double_clicked = True
+		self._cancel_url_open()
 		item = self.table.item(row, column)
 		if not item:
 			return
-		full_url = item.data(Qt.ItemDataRole.UserRole + 1) or item.text()
-		self.table.blockSignals(True)
-		item.setText(str(full_url))
-		self.table.blockSignals(False)
-		self.table.editItem(item)
+		if self.table.state() != QAbstractItemView.State.EditingState:
+			self.table.editItem(item)
 
 	def _set_pill_style(self, widget: QLineEdit, category: str, value: str) -> None:
 		background, foreground = self._color_for(category, value)
@@ -558,7 +602,7 @@ class MainWindow(QWidget):
 		profile = str(self.manager.profile_for(job["company"]))
 		self.database.save_job({"id": job["id"], "profile": profile})
 		thread = QThread(self)
-		worker = RefreshWorker(job, self.manager)
+		worker = RefreshWorker(job, self.manager, allow_manual_login=not self.batch_active)
 		worker.moveToThread(thread)
 		thread.started.connect(worker.run)
 		worker.finished.connect(self.refresh_finished)
@@ -586,6 +630,10 @@ class MainWindow(QWidget):
 
 	def refresh_finished(self, job_id: int, status: str) -> None:
 		self.batch_done += 1
+		if self.batch_active and status == "未知":
+			job = self.database.get_job(job_id)
+			if job:
+				self.batch_failures.append(f"{job['company']}（需要登录或未找到状态）")
 		old_job = self.database.get_job(job_id)
 		old_status = old_job["status"] if old_job else "未查询"
 		self.database.update_status(job_id, status, now_text())
@@ -607,9 +655,18 @@ class MainWindow(QWidget):
 		else:
 			self.progress.setText(f"已更新：{status}")
 		self._show_status_change(job_id, old_status, status)
+		if mail_stage(status):
+			if self.batch_active:
+				self.mail_batch_needed = True
+			else:
+				self.mail_panel.sync()
 
 	def refresh_failed(self, job_id: int, reason: str) -> None:
 		self.batch_done += 1
+		if self.batch_active:
+			job = self.database.get_job(job_id)
+			if job:
+				self.batch_failures.append(f"{job['company']}（{reason}）")
 		self.progress.setText(f"更新失败（{job_id}）：{reason} ({self.batch_done}/{self.batch_total})")
 
 	def update_all(self) -> None:
@@ -623,6 +680,8 @@ class MainWindow(QWidget):
 		logger.info("批量刷新跳过: count=%s（已标记或已是终态）", skipped_count)
 		self.batch_queue = jobs
 		self.batch_active = bool(jobs)
+		self.batch_failures = []
+		self.mail_batch_needed = False
 		self.batch_total = len(jobs)
 		self.batch_done = 0
 		self.progress.setText(f"正在更新 0/{self.batch_total}")
@@ -634,13 +693,30 @@ class MainWindow(QWidget):
 	def _start_next_batch_job(self) -> None:
 		if not self.batch_queue:
 			self.batch_active = False
-			self.progress.setText(f"更新完成 {self.batch_done}/{self.batch_total}")
+			if self.mail_batch_needed:
+				self.mail_batch_needed = False
+				self.mail_panel.sync()
+			if self.batch_failures:
+				self.progress.setText("更新完成，失败/需登录：" + "、".join(self.batch_failures))
+			else:
+				self.progress.setText(f"更新完成 {self.batch_done}/{self.batch_total}")
 			logger.info("批量刷新完成: total=%s", self.batch_total)
+			if self.batch_failures:
+				logger.warning("批量刷新失败列表: %s", "、".join(self.batch_failures))
 			return
 		job = self.batch_queue.pop(0)
 		logger.info("批量刷新进度: %s/%s company=%s", self.batch_done + 1, self.batch_total, job["company"])
 		self._start_refresh(job)
 
 	def closeEvent(self, event) -> None:
+		if self.mail_panel.is_busy() or any(thread.isRunning() for thread in self.threads):
+			if self.mail_panel.worker:
+				self.mail_panel.pending_sync = False
+				self.mail_panel.worker.requestInterruption()
+			self.progress.setText("后台任务尚未结束，请稍候再关闭；邮箱同步正在取消")
+			event.ignore()
+			return
+		self.mail_panel.stop()
+		self._cancel_url_open()
 		self.database.close()
 		event.accept()

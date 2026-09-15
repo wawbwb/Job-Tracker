@@ -3,3 +3,4 @@ PyQt6
 playwright
 pandas
 apscheduler
+keyring>=25,<26

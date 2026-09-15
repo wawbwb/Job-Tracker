@@ -2,6 +2,20 @@
 /data/*
 !/data/.gitkeep
 
+# Local mailbox credentials / manual exports (the app uses the OS credential vault)
+.env
+.env.*
+!.env.example
+mail_credentials*.json
+qq_mail_credentials*.json
+mail_secrets.*
+qq_mail_auth_code.*
+*授权码*.txt
+*授权码*.json
+*授权码*.csv
+*授权码*.png
+*授权码*.jpg
+
 # Python generated files
 __pycache__/
 *.py[cod]
@@ -9,3 +23,16 @@ __pycache__/
 # Local development files
 .vscode/*.log
 *.log
+
+# Generated Windows application bundles
+/build/
+/dist/
+/dist.zip
+
+# Database and browser-session copies outside the data directory
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+**/state.json
